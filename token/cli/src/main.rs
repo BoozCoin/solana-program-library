@@ -1,4 +1,6 @@
-#![allow(deprecated)] // TODO: Remove when SPL upgrades to Solana 1.8
+#![allow(deprecated)]
+
+// TODO: Remove when SPL upgrades to Solana 1.8
 use clap::{
     crate_description, crate_name, crate_version, value_t, value_t_or_exit, App, AppSettings, Arg,
     ArgMatches, SubCommand,
@@ -15,7 +17,7 @@ use solana_clap_utils::{
         is_amount, is_amount_or_all, is_parsable, is_url_or_moniker, is_valid_pubkey,
         is_valid_signer, normalize_to_url_if_moniker,
     },
-    keypair::{signer_from_path, CliSignerInfo},
+    keypair::{signer_from_path, CliSignerInfo, pubkey_from_path},
     memo::memo_arg,
     nonce::*,
     offline::{self, *},
@@ -51,17 +53,21 @@ use spl_token::{
 use std::{collections::HashMap, fmt::Display, process::exit, str::FromStr, sync::Arc};
 
 mod config;
+
 use config::Config;
 
 mod output;
+
 use output::*;
 
 mod sort;
+
 use sort::sort_and_parse_token_accounts;
 
 mod rpc_client_utils;
 
 mod bench;
+
 use bench::*;
 
 pub const OWNER_ADDRESS_ARG: ArgConstant<'static> = ArgConstant {
@@ -231,7 +237,7 @@ pub(crate) fn check_fee_payer_balance(config: &Config, required_balance: u64) ->
             lamports_to_sol(required_balance),
             lamports_to_sol(balance)
         )
-        .into())
+            .into())
     } else {
         Ok(())
     }
@@ -250,13 +256,14 @@ fn check_wallet_balance(
             lamports_to_sol(required_balance),
             lamports_to_sol(balance)
         )
-        .into())
+            .into())
     } else {
         Ok(())
     }
 }
 
 type SignersOf = Vec<(Box<dyn Signer>, Pubkey)>;
+
 pub fn signers_of(
     matches: &ArgMatches<'_>,
     name: &str,
@@ -519,7 +526,7 @@ fn command_authorize(
                         "Error: attempting to change the `{}` of an associated token account",
                         auth_str
                     )
-                    .into())
+                        .into())
                 } else {
                     Ok(())
                 }
@@ -608,7 +615,7 @@ pub(crate) fn resolve_mint_info(
                     "Source {:?} does not contain {:?} tokens",
                     token_account, mint
                 )
-                .into());
+                    .into());
             }
         }
         Ok((source_mint, source_account.token_amount.decimals))
@@ -686,7 +693,7 @@ fn command_transfer(
                 "Error: Sender has insufficient funds, current balance is {}",
                 sender_token_amount.real_number_string_trimmed()
             )
-            .into());
+                .into());
         }
         transfer_balance
     } else {
@@ -709,7 +716,7 @@ fn command_transfer(
             return Err("Error: The recipient address is not funded. \
                                     Add `--allow-unfunded-recipient` to complete the transfer \
                                    "
-            .into());
+                .into());
         }
 
         recipient_account_info.unwrap_or(false)
@@ -806,6 +813,207 @@ fn command_transfer(
     if let Some(text) = memo {
         instructions.push(spl_memo::build_memo(text.as_bytes(), &[&config.fee_payer]));
     }
+    let tx_return = handle_tx(
+        &CliSignerInfo {
+            signers: bulk_signers,
+        },
+        config,
+        no_wait,
+        minimum_balance_for_rent_exemption,
+        instructions,
+    )?;
+    Ok(match tx_return {
+        TransactionReturnData::CliSignature(signature) => {
+            config.output_format.formatted_string(&signature)
+        }
+        TransactionReturnData::CliSignOnlyData(sign_only_data) => {
+            config.output_format.formatted_string(&sign_only_data)
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_multi_transfer(
+    config: &Config,
+    token: Pubkey,
+    transfers: Vec<(Pubkey, f64)>,
+    sender: Option<Pubkey>,
+    sender_owner: Pubkey,
+    allow_unfunded_recipient: bool,
+    fund_recipient: bool,
+    mint_decimals: Option<u8>,
+    recipient_is_ata_owner: bool,
+    use_unchecked_instruction: bool,
+    memo: Option<String>,
+    bulk_signers: BulkSigners,
+    no_wait: bool,
+) -> CommandResult {
+    let sender = if let Some(sender) = sender {
+        sender
+    } else {
+        get_associated_token_address(&sender_owner, &token)
+    };
+    let (mint_pubkey, decimals) = resolve_mint_info(config, &sender, Some(token), mint_decimals)?;
+
+    let mut instructions = vec![];
+    let mut transfer_balance = 0;
+    let mut minimum_balance_for_rent_exemption = 0;
+
+    for (i, (recipient, ui_amount)) in transfers.iter().enumerate() {
+        println_display(
+            config,
+            format!(
+                "Transfer #{}, {} tokens\n  Sender: {}\n  Recipient: {}",
+                i + 1,
+                *ui_amount,
+                sender,
+                *recipient,
+            ),
+        );
+
+        let mut recipient_token_account = *recipient;
+
+        let amount = spl_token::ui_amount_to_amount(*ui_amount, decimals);
+        transfer_balance += amount;
+
+        let recipient_is_token_account = if !config.sign_only {
+            let recipient_account_info = config
+                .rpc_client
+                .get_account_with_commitment(&recipient, config.rpc_client.commitment())?
+                .value
+                .map(|account| account.owner == spl_token::id() && account.data.len() == Account::LEN);
+
+            if recipient_account_info.is_none() && !allow_unfunded_recipient {
+                return Err("Error: The recipient address is not funded. \
+                                        Add `--allow-unfunded-recipient` to complete the transfer \
+                                       "
+                    .into());
+            }
+
+            recipient_account_info.unwrap_or(false)
+        } else {
+            !recipient_is_ata_owner
+        };
+
+        if !recipient_is_token_account {
+            recipient_token_account = get_associated_token_address(&recipient, &mint_pubkey);
+            println_display(
+                config,
+                format!(
+                    "  Recipient associated token account: {}",
+                    recipient_token_account
+                ),
+            );
+
+            let needs_funding = if !config.sign_only {
+                if let Some(recipient_token_account_data) = config
+                    .rpc_client
+                    .get_account_with_commitment(
+                        &recipient_token_account,
+                        config.rpc_client.commitment(),
+                    )?
+                    .value
+                {
+                    if recipient_token_account_data.owner == system_program::id() {
+                        true
+                    } else if recipient_token_account_data.owner == spl_token::id() {
+                        false
+                    } else {
+                        return Err(
+                            format!("Error: Unsupported recipient address: {}", recipient).into(),
+                        );
+                    }
+                } else {
+                    true
+                }
+            } else {
+                fund_recipient
+            };
+
+            if needs_funding {
+                if fund_recipient {
+                    if !config.sign_only {
+                        minimum_balance_for_rent_exemption += config
+                            .rpc_client
+                            .get_minimum_balance_for_rent_exemption(Account::LEN)?;
+                        println_display(
+                            config,
+                            format!(
+                                "  Funding recipient: {} ({} SOL)",
+                                recipient_token_account,
+                                lamports_to_sol(minimum_balance_for_rent_exemption)
+                            ),
+                        );
+                    }
+                    instructions.push(create_associated_token_account(
+                        &config.fee_payer,
+                        &recipient,
+                        &mint_pubkey,
+                    ));
+                } else {
+                    return Err(
+                        "Error: Recipient's associated token account does not exist. \
+                                        Add `--fund-recipient` to fund their account"
+                            .into(),
+                    );
+                }
+            }
+        }
+
+        if use_unchecked_instruction {
+            instructions.push(transfer(
+                &spl_token::id(),
+                &sender,
+                &recipient_token_account,
+                &sender_owner,
+                &config.multisigner_pubkeys,
+                transfer_balance,
+            )?);
+        } else {
+            instructions.push(transfer_checked(
+                &spl_token::id(),
+                &sender,
+                &mint_pubkey,
+                &recipient_token_account,
+                &sender_owner,
+                &config.multisigner_pubkeys,
+                transfer_balance,
+                decimals,
+            )?);
+        }
+
+        if let Some(text) = memo.clone() {
+            instructions.push(spl_memo::build_memo(text.as_bytes(), &[&config.fee_payer]));
+        }
+    }
+
+    if !config.sign_only {
+        let sender_token_amount = config
+            .rpc_client
+            .get_token_account_balance(&sender)
+            .map_err(|err| {
+                format!(
+                    "Error: Failed to get token balance of sender address {}: {}",
+                    sender, err
+                )
+            })?;
+        let sender_balance = sender_token_amount.amount.parse::<u64>().map_err(|err| {
+            format!(
+                "Token account {} balance could not be parsed: {}",
+                sender, err
+            )
+        })?;
+
+        if transfer_balance > sender_balance {
+            return Err(format!(
+                "Error: Sender has insufficient funds, current balance is {} total transferamount is {}",
+                sender_token_amount.real_number_string_trimmed(),
+                spl_token::amount_to_ui_amount(transfer_balance, decimals)
+            )
+                .into());
+        }
+    }
+
     let tx_return = handle_tx(
         &CliSignerInfo {
             signers: bulk_signers,
@@ -1303,7 +1511,7 @@ fn command_close(
                 account,
                 source_account.token_amount.real_number_string_trimmed()
             )
-            .into());
+                .into());
         }
     }
 
@@ -1469,7 +1677,7 @@ fn command_gc(
         if let UiAccountData::Json(parsed_account) = keyed_account.account.data {
             if parsed_account.program == "spl-token" {
                 if let Ok(TokenAccountType::Account(ui_token_account)) =
-                    serde_json::from_value(parsed_account.parsed)
+                serde_json::from_value(parsed_account.parsed)
                 {
                     let frozen = ui_token_account.state == UiAccountState::Frozen;
 
@@ -1632,6 +1840,7 @@ fn command_sync_native(
 }
 
 struct SignOnlyNeedsFullMintSpec {}
+
 impl offline::ArgsConfig for SignOnlyNeedsFullMintSpec {
     fn sign_only_arg<'a, 'b>(&self, arg: Arg<'a, 'b>) -> Arg<'a, 'b> {
         arg.requires_all(&[MINT_ADDRESS_ARG.name, MINT_DECIMALS_ARG.name])
@@ -1639,6 +1848,7 @@ impl offline::ArgsConfig for SignOnlyNeedsFullMintSpec {
 }
 
 struct SignOnlyNeedsMintDecimals {}
+
 impl offline::ArgsConfig for SignOnlyNeedsMintDecimals {
     fn sign_only_arg<'a, 'b>(&self, arg: Arg<'a, 'b>) -> Arg<'a, 'b> {
         arg.requires_all(&[MINT_DECIMALS_ARG.name])
@@ -1646,6 +1856,7 @@ impl offline::ArgsConfig for SignOnlyNeedsMintDecimals {
 }
 
 struct SignOnlyNeedsMintAddress {}
+
 impl offline::ArgsConfig for SignOnlyNeedsMintAddress {
     fn sign_only_arg<'a, 'b>(&self, arg: Arg<'a, 'b>) -> Arg<'a, 'b> {
         arg.requires_all(&[MINT_ADDRESS_ARG.name])
@@ -1653,6 +1864,7 @@ impl offline::ArgsConfig for SignOnlyNeedsMintAddress {
 }
 
 struct SignOnlyNeedsDelegateAddress {}
+
 impl offline::ArgsConfig for SignOnlyNeedsDelegateAddress {
     fn sign_only_arg<'a, 'b>(&self, arg: Arg<'a, 'b>) -> Arg<'a, 'b> {
         arg.requires_all(&[DELEGATE_ADDRESS_ARG.name])
@@ -1721,50 +1933,50 @@ fn main() -> Result<(), Error> {
         )
         .bench_subcommand()
         .subcommand(SubCommand::with_name(CREATE_TOKEN).about("Create a new token")
-                .arg(
-                    Arg::with_name("token_keypair")
-                        .value_name("TOKEN_KEYPAIR")
-                        .validator(is_valid_signer)
-                        .takes_value(true)
-                        .index(1)
-                        .help(
-                            "Specify the token keypair. \
+                        .arg(
+                            Arg::with_name("token_keypair")
+                                .value_name("TOKEN_KEYPAIR")
+                                .validator(is_valid_signer)
+                                .takes_value(true)
+                                .index(1)
+                                .help(
+                                    "Specify the token keypair. \
                              This may be a keypair file or the ASK keyword. \
                              [default: randomly generated keypair]"
-                        ),
-                )
-                .arg(
-                    Arg::with_name("mint_authority")
-                        .long("mint-authority")
-                        .alias("owner")
-                        .value_name("ADDRESS")
-                        .validator(is_valid_pubkey)
-                        .takes_value(true)
-                        .help(
-                            "Specify the mint authority address. \
+                                ),
+                        )
+                        .arg(
+                            Arg::with_name("mint_authority")
+                                .long("mint-authority")
+                                .alias("owner")
+                                .value_name("ADDRESS")
+                                .validator(is_valid_pubkey)
+                                .takes_value(true)
+                                .help(
+                                    "Specify the mint authority address. \
                              Defaults to the client keypair address."
-                        ),
-                )
-                .arg(
-                    Arg::with_name("decimals")
-                        .long("decimals")
-                        .validator(is_mint_decimals)
-                        .value_name("DECIMALS")
-                        .takes_value(true)
-                        .default_value(default_decimals)
-                        .help("Number of base 10 digits to the right of the decimal place"),
-                )
-                .arg(
-                    Arg::with_name("enable_freeze")
-                        .long("enable-freeze")
-                        .takes_value(false)
-                        .help(
-                            "Enable the mint authority to freeze associated token accounts."
-                        ),
-                )
-                .nonce_args(true)
-                .arg(memo_arg())
-                .offline_args(),
+                                ),
+                        )
+                        .arg(
+                            Arg::with_name("decimals")
+                                .long("decimals")
+                                .validator(is_mint_decimals)
+                                .value_name("DECIMALS")
+                                .takes_value(true)
+                                .default_value(default_decimals)
+                                .help("Number of base 10 digits to the right of the decimal place"),
+                        )
+                        .arg(
+                            Arg::with_name("enable_freeze")
+                                .long("enable-freeze")
+                                .takes_value(false)
+                                .help(
+                                    "Enable the mint authority to freeze associated token accounts."
+                                ),
+                        )
+                        .nonce_args(true)
+                        .arg(memo_arg())
+                        .offline_args(),
         )
         .subcommand(
             SubCommand::with_name("create-account")
@@ -1806,7 +2018,7 @@ fn main() -> Result<(), Error> {
                         .required(true)
                         .help(&format!("The minimum number of signers required \
                             to allow the operation. [{} <= M <= N]",
-                            MIN_SIGNERS,
+                                       MIN_SIGNERS,
                         )),
                 )
                 .arg(
@@ -1820,7 +2032,7 @@ fn main() -> Result<(), Error> {
                         .max_values(MAX_SIGNERS as u64)
                         .help(&format!("The public keys for each of the N \
                             signing members of this account. [{} <= N <= {}]",
-                            MIN_SIGNERS, MAX_SIGNERS,
+                                       MIN_SIGNERS, MAX_SIGNERS,
                         )),
                 )
                 .arg(
@@ -1941,11 +2153,11 @@ fn main() -> Result<(), Error> {
                             [default: owner's associated token account]")
                 )
                 .arg(owner_keypair_arg_with_value_name("SENDER_TOKEN_OWNER_KEYPAIR")
-                        .help(
-                            "Specify the owner of the sending token account. \
+                         .help(
+                             "Specify the owner of the sending token account. \
                             This may be a keypair file, the ASK keyword. \
                             Defaults to the client keypair.",
-                        ),
+                         ),
                 )
                 .arg(
                     Arg::with_name("allow_unfunded_recipient")
@@ -1982,7 +2194,84 @@ fn main() -> Result<(), Error> {
                 .arg(mint_decimals_arg())
                 .nonce_args(true)
                 .arg(memo_arg())
-                .offline_args_config(&SignOnlyNeedsMintDecimals{}),
+                .offline_args_config(&SignOnlyNeedsMintDecimals {}),
+        )
+        .subcommand(
+            SubCommand::with_name("multi-transfer")
+                .about("Transfer tokens from one account to many")
+                .arg(
+                    Arg::with_name("token")
+                        .validator(is_valid_pubkey)
+                        .value_name("TOKEN_ADDRESS")
+                        .takes_value(true)
+                        .index(1)
+                        .required(true)
+                        .help("Token to transfer"),
+                )
+                .arg(
+                    Arg::with_name("transfers")
+                        .multiple(true)
+                        // .validator(is_valid_pubkey)
+                        .value_name("RECIPIENT_ADDRESS or RECIPIENT_TOKEN_ACCOUNT_ADDRESS")
+                        .takes_value(true)
+                        .index(2)
+                        .required(true)
+                        .help("If a token account address is provided, use it as the recipient. \
+                               Otherwise assume the recipient address is a user wallet and transfer to \
+                               the associated token account")
+                )
+                .arg(
+                    Arg::with_name("from")
+                        .validator(is_valid_pubkey)
+                        .value_name("SENDER_TOKEN_ACCOUNT_ADDRESS")
+                        .takes_value(true)
+                        .long("from")
+                        .help("Specify the sending token account \
+                            [default: owner's associated token account]")
+                )
+                .arg(owner_keypair_arg_with_value_name("SENDER_TOKEN_OWNER_KEYPAIR")
+                         .help(
+                             "Specify the owner of the sending token account. \
+                            This may be a keypair file, the ASK keyword. \
+                            Defaults to the client keypair.",
+                         ),
+                )
+                .arg(
+                    Arg::with_name("allow_unfunded_recipient")
+                        .long("allow-unfunded-recipient")
+                        .takes_value(false)
+                        .help("Complete the transfer even if the recipient address is not funded")
+                )
+                .arg(
+                    Arg::with_name("allow_empty_recipient")
+                        .long("allow-empty-recipient")
+                        .takes_value(false)
+                        .hidden(true) // Deprecated, use --allow-unfunded-recipient instead
+                )
+                .arg(
+                    Arg::with_name("fund_recipient")
+                        .long("fund-recipient")
+                        .takes_value(false)
+                        .help("Create the associated token account for the recipient if doesn't already exist")
+                )
+                .arg(
+                    Arg::with_name("no_wait")
+                        .long("no-wait")
+                        .takes_value(false)
+                        .help("Return signature immediately after submitting the transaction, instead of waiting for confirmations"),
+                )
+                .arg(
+                    Arg::with_name("recipient_is_ata_owner")
+                        .long("recipient-is-ata-owner")
+                        .takes_value(false)
+                        .requires("sign_only")
+                        .help("In sign-only mode, specifies that the recipient is the owner of the associated token account rather than an actual token account"),
+                )
+                .arg(multisig_signer_arg())
+                .arg(mint_decimals_arg())
+                .nonce_args(true)
+                .arg(memo_arg())
+                .offline_args_config(&SignOnlyNeedsMintDecimals {}),
         )
         .subcommand(
             SubCommand::with_name("burn")
@@ -2006,17 +2295,17 @@ fn main() -> Result<(), Error> {
                         .help("Amount to burn, in tokens"),
                 )
                 .arg(owner_keypair_arg_with_value_name("SOURCE_TOKEN_OWNER_KEYPAIR")
-                        .help(
-                            "Specify the source token owner account. \
+                         .help(
+                             "Specify the source token owner account. \
                             This may be a keypair file, the ASK keyword. \
                             Defaults to the client keypair.",
-                        ),
+                         ),
                 )
                 .arg(multisig_signer_arg())
                 .mint_args()
                 .nonce_args(true)
                 .arg(memo_arg())
-                .offline_args_config(&SignOnlyNeedsFullMintSpec{}),
+                .offline_args_config(&SignOnlyNeedsFullMintSpec {}),
         )
         .subcommand(
             SubCommand::with_name("mint")
@@ -2063,7 +2352,7 @@ fn main() -> Result<(), Error> {
                 .arg(mint_decimals_arg())
                 .arg(multisig_signer_arg())
                 .nonce_args(true)
-                .offline_args_config(&SignOnlyNeedsMintDecimals{}),
+                .offline_args_config(&SignOnlyNeedsMintDecimals {}),
         )
         .subcommand(
             SubCommand::with_name("freeze")
@@ -2093,7 +2382,7 @@ fn main() -> Result<(), Error> {
                 .arg(mint_address_arg())
                 .arg(multisig_signer_arg())
                 .nonce_args(true)
-                .offline_args_config(&SignOnlyNeedsMintAddress{}),
+                .offline_args_config(&SignOnlyNeedsMintAddress {}),
         )
         .subcommand(
             SubCommand::with_name("thaw")
@@ -2123,7 +2412,7 @@ fn main() -> Result<(), Error> {
                 .arg(mint_address_arg())
                 .arg(multisig_signer_arg())
                 .nonce_args(true)
-                .offline_args_config(&SignOnlyNeedsMintAddress{}),
+                .offline_args_config(&SignOnlyNeedsMintAddress {}),
         )
         .subcommand(
             SubCommand::with_name("wrap")
@@ -2224,7 +2513,7 @@ fn main() -> Result<(), Error> {
                 .arg(multisig_signer_arg())
                 .mint_args()
                 .nonce_args(true)
-                .offline_args_config(&SignOnlyNeedsFullMintSpec{}),
+                .offline_args_config(&SignOnlyNeedsFullMintSpec {}),
         )
         .subcommand(
             SubCommand::with_name("revoke")
@@ -2243,7 +2532,7 @@ fn main() -> Result<(), Error> {
                 .arg(delegate_address_arg())
                 .arg(multisig_signer_arg())
                 .nonce_args(true)
-                .offline_args_config(&SignOnlyNeedsDelegateAddress{}),
+                .offline_args_config(&SignOnlyNeedsDelegateAddress {}),
         )
         .subcommand(
             SubCommand::with_name("close")
@@ -2401,12 +2690,12 @@ fn main() -> Result<(), Error> {
                 .about("Query details about and SPL Token multisig account by address")
                 .arg(
                     Arg::with_name("address")
-                    .validator(is_valid_pubkey)
-                    .value_name("MULTISIG_ACCOUNT_ADDRESS")
-                    .takes_value(true)
-                    .index(1)
-                    .required(true)
-                    .help("The address of the SPL Token multisig account to query"),
+                        .validator(is_valid_pubkey)
+                        .value_name("MULTISIG_ACCOUNT_ADDRESS")
+                        .takes_value(true)
+                        .index(1)
+                        .required(true)
+                        .help("The address of the SPL Token multisig account to query"),
                 ),
         )
         .subcommand(
@@ -2415,9 +2704,9 @@ fn main() -> Result<(), Error> {
                 .arg(owner_keypair_arg())
                 .arg(
                     Arg::with_name("close_empty_associated_accounts")
-                    .long("close-empty-associated-accounts")
-                    .takes_value(false)
-                    .help("close all empty associated token accounts (to get SOL back)")
+                        .long("close-empty-associated-accounts")
+                        .takes_value(false)
+                        .help("close all empty associated token accounts (to get SOL back)")
                 )
         )
         .subcommand(
@@ -2471,14 +2760,14 @@ fn main() -> Result<(), Error> {
             "fee_payer",
             &mut wallet_manager,
         )
-        .map(|s| {
-            let p = s.pubkey();
-            (s, p)
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("error: {}", e);
-            exit(1);
-        });
+            .map(|s| {
+                let p = s.pubkey();
+                (s, p)
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("error: {}", e);
+                exit(1);
+            });
         bulk_signers.push(signer);
 
         let verbose = matches.is_present("verbose");
@@ -2509,14 +2798,14 @@ fn main() -> Result<(), Error> {
                 NONCE_AUTHORITY_ARG.name,
                 &mut wallet_manager,
             )
-            .map(|s| {
-                let p = s.pubkey();
-                (s, p)
-            })
-            .unwrap_or_else(|e| {
-                eprintln!("error: {}", e);
-                exit(1);
-            });
+                .map(|s| {
+                    let p = s.pubkey();
+                    (s, p)
+                })
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {}", e);
+                    exit(1);
+                });
             bulk_signers.push(signer);
 
             Some(nonce_authority)
@@ -2695,6 +2984,59 @@ fn main() -> Result<(), Error> {
                 token,
                 amount,
                 recipient,
+                sender,
+                owner,
+                allow_unfunded_recipient,
+                fund_recipient,
+                mint_decimals,
+                recipient_is_ata_owner,
+                use_unchecked_instruction,
+                memo,
+                bulk_signers,
+                matches.is_present("no_wait"),
+            )
+        }
+
+        ("multi-transfer", Some(arg_matches)) => {
+            let token = pubkey_of_signer(arg_matches, "token", &mut wallet_manager)
+                .unwrap()
+                .unwrap();
+
+            let transfers = arg_matches.values_of("transfers")
+                .unwrap()
+                .map(|transfer| {
+                    let transfer_: Vec<_> = transfer.split(':').collect();
+                    match transfer_[..] {
+                        [recipient, amount] =>
+                            (
+                                pubkey_from_path(arg_matches, recipient, "transfers", &mut wallet_manager).unwrap(),
+                                amount.parse().unwrap()
+                            ),
+                        _ =>
+                            panic!("Bad transfer format: {}, must be 'Pubkey:Amount'", transfer)
+                    }
+                })
+                .collect();
+
+            let sender = pubkey_of_signer(arg_matches, "from", &mut wallet_manager).unwrap();
+
+            let (owner_signer, owner) =
+                config.signer_or_default(arg_matches, "owner", &mut wallet_manager);
+            bulk_signers.push(owner_signer);
+
+            let mint_decimals = value_of::<u8>(arg_matches, MINT_DECIMALS_ARG.name);
+            let fund_recipient = matches.is_present("fund_recipient");
+            let allow_unfunded_recipient = matches.is_present("allow_empty_recipient")
+                || matches.is_present("allow_unfunded_recipient");
+
+            let recipient_is_ata_owner = matches.is_present("recipient_is_ata_owner");
+            let use_unchecked_instruction = matches.is_present("use_unchecked_instruction");
+            let memo = value_t!(arg_matches, "memo", String).ok();
+
+            command_multi_transfer(
+                &config,
+                token,
+                transfers,
                 sender,
                 owner,
                 allow_unfunded_recipient,
@@ -2957,24 +3299,26 @@ fn main() -> Result<(), Error> {
         }
         _ => unreachable!(),
     }
-    .map_err::<Error, _>(|err| DisplayError::new_as_boxed(err).into())?;
+        .map_err::<Error, _>(|err| DisplayError::new_as_boxed(err).into())?;
     println!("{}", result);
     Ok(())
 }
 
 fn format_output<T>(command_output: T, command_name: &str, config: &Config) -> String
-where
-    T: Serialize + Display + QuietDisplay + VerboseDisplay,
+    where
+        T: Serialize + Display + QuietDisplay + VerboseDisplay,
 {
     config.output_format.formatted_string(&CommandOutput {
         command_name: String::from(command_name),
         command_output,
     })
 }
+
 enum TransactionReturnData {
     CliSignature(CliSignature),
     CliSignOnlyData(CliSignOnlyData),
 }
+
 fn handle_tx(
     signer_info: &CliSignerInfo,
     config: &Config,
