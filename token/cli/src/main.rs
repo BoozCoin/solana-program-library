@@ -960,17 +960,17 @@ fn command_multi_transfer(
             }
         }
 
-        if use_unchecked_instruction {
-            instructions.push(transfer(
+        let instruction = if use_unchecked_instruction {
+            transfer(
                 &spl_token::id(),
                 &sender,
                 &recipient_token_account,
                 &sender_owner,
                 &config.multisigner_pubkeys,
                 transfer_balance,
-            )?);
+            )?
         } else {
-            instructions.push(transfer_checked(
+            transfer_checked(
                 &spl_token::id(),
                 &sender,
                 &mint_pubkey,
@@ -979,8 +979,10 @@ fn command_multi_transfer(
                 &config.multisigner_pubkeys,
                 transfer_balance,
                 decimals,
-            )?);
-        }
+            )?
+        };
+
+        instructions.push(instruction);
 
         if let Some(text) = memo.clone() {
             instructions.push(spl_memo::build_memo(text.as_bytes(), &[&config.fee_payer]));
