@@ -844,6 +844,7 @@ fn command_multi_transfer(
     mint_decimals: Option<u8>,
     recipient_is_ata_owner: bool,
     use_unchecked_instruction: bool,
+    freeze_recipients: bool,
     memo: Option<String>,
     bulk_signers: BulkSigners,
     no_wait: bool,
@@ -983,6 +984,16 @@ fn command_multi_transfer(
         };
 
         instructions.push(instruction);
+
+        if freeze_recipients {
+            instructions.push(freeze_account(
+                &spl_token::id(),
+                &recipient_token_account,
+                &mint_pubkey,
+                &sender_owner,
+                &config.multisigner_pubkeys,
+            )?);
+        }
 
         if let Some(text) = memo.clone() {
             instructions.push(spl_memo::build_memo(text.as_bytes(), &[&config.fee_payer]));
@@ -2257,6 +2268,12 @@ fn main() -> Result<(), Error> {
                         .help("Create the associated token account for the recipient if doesn't already exist")
                 )
                 .arg(
+                    Arg::with_name("freeze_recipients")
+                        .long("freeze-recipients")
+                        .takes_value(false)
+                        .help("Freeze every recipient of the token in this transaction")
+                )
+                .arg(
                     Arg::with_name("no_wait")
                         .long("no-wait")
                         .takes_value(false)
@@ -3033,6 +3050,7 @@ fn main() -> Result<(), Error> {
 
             let recipient_is_ata_owner = matches.is_present("recipient_is_ata_owner");
             let use_unchecked_instruction = matches.is_present("use_unchecked_instruction");
+            let freeze_recipients = matches.is_present("freeze_recipients");
             let memo = value_t!(arg_matches, "memo", String).ok();
 
             command_multi_transfer(
@@ -3046,6 +3064,7 @@ fn main() -> Result<(), Error> {
                 mint_decimals,
                 recipient_is_ata_owner,
                 use_unchecked_instruction,
+                freeze_recipients,
                 memo,
                 bulk_signers,
                 matches.is_present("no_wait"),
